@@ -1,0 +1,346 @@
+---
+title: "BCB420 Assignment 1"
+author: "Jiahao Gu"
+date: 2024/02/13
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+bibliography: bcb420_a1.bib
+csl: nature.csl
+---
+
+## Introduction {#Q123}
+
+This dataset from Zaccaria et al. [@zaccaria2022multiomic] is of interest since it employs a multi-omic (proteomic + transcriptomic) approach to study differential expression caused by Parkinson's Disease (PD) in human neurons. A combined analysis of the transcriptome and proteome is likely to yield more extensive insights into how PD alters neuron biology and advance understanding of the pathophysiology that underlies neurodegeneration in PD.
+
+Based on the paper, the data was collected from RNA-Seq analysis of brain tissue obtained from autopsy of patients with and without Parkinson's Disease. 3 samples were presented for each group (non-afflicted/control and afflicted/Parkinson's) and 2 technical replicates were performed for each sample using different regions of the tissue.
+
+## Dataset Pre-processing
+
+The data was loaded using GEOquery [@davis2007geoquery]. Metadata, including related database entries, provided additional information regarding which samples corresponded to which conditions.
+
+```{r message = FALSE, warning = FALSE}
+library(GEOquery)
+geoID <- "GSE169755"
+gse <- getGEO(geoID, GSEMatrix = FALSE)
+gse@header$relation # this information will become useful very soon
+```
+
+Raw counts were loaded from the supplementary file. The raw data contains expression data for 26485 genes across 12 samples (2 groups x 3 tissue samples per group x 2 replicates per tissue sample).
+
+```{r message = FALSE, warning = FALSE}
+download_dir <- file.path(getwd())
+
+# fetch file only if it is not yet in the download directory
+if (!(file.exists(file.path(download_dir, geoID, "GSE169755_raw_counts.txt.gz")))){
+  rawfile <- getGEOSuppFiles("GSE169755", fetch_files=TRUE, baseDir = download_dir)
+}
+```
+
+```{r message = FALSE, warning = FALSE}
+rawdata <- read.table(file.path(download_dir, geoID, "GSE169755_raw_counts.txt.gz"),
+                      header = TRUE, check.names = TRUE)
+dim(rawdata) # 26485 rows x 13 columns
+any(is.na(rawdata)) # FALSE
+```
+
+After loading, the data was sorted into the control group and Parkinson's group. This information appears to be missing from the metadata but can be retrieved from the BioProject entry listed under related entries.
+
+```{r message = FALSE, warning = FALSE}
+origNames <- rawdata$geneName
+ctrl <- rawdata[,c(4,5,8,9,10,11)]
+PD <- rawdata[,c(2,3,6,7,12,13)]
+ctrl <- cbind(origNames, ctrl)
+PD <- cbind(origNames, PD)
+
+# combine back into a single dataframe in the order we want
+rawdata <- merge(ctrl, PD, by="origNames")
+colnames(rawdata) <- c("geneNames", "C1A", "C1B", "C2A", "C2B", "C3A", "C3B","P1A", "P1B", "P2A", "P2B", "P3A", "P3B")
+
+summary(rawdata)
+```
+
+Preliminary overviews of the data show that at least 25% of the genes are not expressed at all, suggesting that 25-50% of the genes should ideally be filtered out during processing to remove noise.
+
+## Mapping {#Q45}
+
+Mapping of gene names to approved HUGO symbols was achieved with the biomaRt package [@durinck2009mapping]. From the available options, converting from external_gene_name to hgnc_symbol is likely the most suitable choice.
+
+```{r message = FALSE, warning = FALSE}
+library(biomaRt)
+datasets <- listDatasets(useMart("ensembl"))
+
+# get name of H. sapiens dataset
+dname <- datasets$dataset[grep(datasets$dataset, pattern="sapiens")]
+ensembl <- useDataset(dname, mart=useMart("ensembl"))
+filters <- listFilters(ensembl)
+
+# looking at the options, external_gene_name is the best option to convert from
+filters[grep(filters$name, pattern="name"), ] 
+```
+
+Since the raw data is organized by gene name, the mapping takes the listed names to (ideally unique) approved HGNC symbols. The converted symbols were stored to minimize computation.
+
+```{r message = FALSE, warning = FALSE}
+# load R object if mapping has previously been determined
+preconverted <- "~/projects/nameConv.rds"
+if (file.exists(preconverted)){
+  nameConv <- readRDS(preconverted)
+} else {
+  nameConv <- getBM(attributes = c("external_gene_name", "hgnc_symbol"), 
+                    filters=c("hgnc_symbol"), 
+                    values=origNames, mart=ensembl)
+  saveRDS(nameConv, preconverted)
+}
+length(rawdata$geneNames)-length(nameConv$external_gene_name)
+```
+
+3399 genes could not be mapped. This is because some of them are outdated symbols and others are outdated aliases. These changes accumulated over a long period of time (the Ensembl database has undergone 8 iterations since the paper was published), so retrieving the intended mapping using Ensembl alone may be difficult.
+
+Instead, all of the unmapped names were printed into a .txt file and submitted to the HUGO symbol checker [@seal2023genenames], which keeps track of aliases and previous symbols.
+
+```{r message = FALSE, warning = FALSE}
+unmapped <- setdiff(origNames, nameConv$external_gene_name)
+if (!(file.exists("~/projects/unmapped.txt"))){
+  sink("~/projects/unmapped.txt")
+  cat(unmapped)
+  sink()
+}
+
+```
+
+The resulting .csv file was downloaded into the projects directory. The file is modified to remove the first line (sep=,) as this interferes with how the read.csv function in R loads the data. 1764 additional entries have been mapped according to their aliases.
+
+```{r message = FALSE, warning = FALSE}
+newmap <- read.csv("~/projects/hgnc-symbol-check.csv")
+
+# replace all empty strings (unmatched names) with NA
+newmap$Approved.symbol[nchar(newmap$Approved.symbol)==0] <- NA
+
+# get number of symbols that are now mapped to an approved HGNC symbol
+length(newmap$Approved.symbol[!is.na(newmap$Approved.symbol)])
+
+# combine everything into one dataframe will all the mappings
+remapped <- newmap[!is.na(newmap$Approved.symbol), c(1,3)]
+colnames(remapped) <- c("external_gene_name", "hgnc_symbol")
+allConv <- rbind(nameConv, remapped)
+```
+
+There are still some names that remain unmapped at this stage, which are removed from the raw data. It is expected that multiple one-to-many and many-to-one mappings exist at this point, but the specific genes falling into either category are unknown. The one-to-many mappings can be identified and handled first.
+
+```{r message = FALSE, warning = FALSE}
+nowmapped <- origNames %in% allConv$external_gene_name
+procData <- rawdata[nowmapped,]
+mNames <- procData$geneNames
+  
+onetomany <- vector(mode="list") #initialize empty list
+
+# for loop runtime is about 30 seconds
+for (i in 1:length(mNames)){
+  hgnc <- allConv[which(rowSums(as.matrix(allConv$external_gene_name) == mNames[i]) > 0),2] # this is faster than grep
+  if (length(unique(hgnc)) == 1){
+    mNames[i] <- unique(hgnc)
+  } else {
+    onetomany <- append(onetomany, mNames[i])
+  }
+}
+
+# take a look at some of the names that map to multiple symbols
+allConv[allConv$external_gene_name == "STRA13", ]
+allConv[allConv$external_gene_name == "DEC1", ]
+
+```
+
+Both of the above examples have BHLHE40 as a possible symbol, but also an alternative symbol that is equally valid. To preserve as much original data as possible, these names should be mapped to the alternative symbols wherever possible. In some cases one of the possible HGNC symbols is the same as the listed name, so this would be the second preference to resolve one-to-many mappings. If neither option is available, the first HGNC symbol in the list is arbitrarily chosen.
+
+```{r message = FALSE, warning = FALSE}
+# define a function that resolves one-to-many mappings in the order of preference
+resolveOneToMany <- function(otm){
+  possible_symbols <- allConv[allConv$external_gene_name == otm, 2]
+  alternatives <- setdiff(possible_symbols, mNames) # get unique symbols if available
+  if (length(alternatives) > 0){
+    return(alternatives[1]) 
+  } else if(otm %in% possible_symbols){
+    return(otm) 
+  } else {return(possible_symbols[1])}
+}
+
+# construct a dataframe similar to allConv using the new mappings
+otm_dict <- data.frame(unlist(onetomany), sapply(onetomany, resolveOneToMany))
+colnames(otm_dict) <- c("external_gene_name", "hgnc_symbol")
+
+# apply the new mappings in an efficient manner
+for (i in 1:length(otm_dict$external_gene_name)){
+  index <- which(mNames == otm_dict$external_gene_name[i])
+  mNames[index] <- otm_dict$hgnc_symbol[i]
+}
+```
+
+The many-to-one mappings must also be resolved. Since these usually represent transcripts initially thought to be distinct but have since been found to represent the same protein/lncRNA (or very similar variants), it is reasonable to sum the counts and name the total with the single HGNC symbol to capture this fact.
+
+To keep track of changes, the rows are dropped after summing and the sum is appended onto the bottom of the data frame.
+
+```{r message = FALSE, warning = FALSE}
+# get duplicated names
+manytoone <- mNames[duplicated(mNames)]
+
+# store gene names as rownames to facilitate colSums
+temp <- procData[,-1]
+rownames(temp) <- procData$geneNames
+for (mto in manytoone){
+  # get all rows with the same HGNC symbol
+  dup <- allConv[allConv$hgnc_symbol == mto, 1]
+  rowsWithName <- temp[dup, ]
+  # drop these rows from the data frame
+  temp <- temp[!(row.names(temp) %in% dup),]
+  # add up within each column and append back onto the dataframe
+  combinedRow <- colSums(rowsWithName)
+  names(combinedRow) <- mto
+  temp <- rbind(temp, combinedRow)
+}
+
+# restore the gene names as a column in the data frame
+hgnc <- c(mNames[!(mNames %in% manytoone)], manytoone)
+temp <- cbind(hgnc, temp)
+temp <- na.omit(temp)
+```
+
+The original names (row names) should mostly align with the mapped symbols (column 1) except for the duplicated entries that were appended at the end. This is indeed the case, so the row names were removed and the mapping is complete. In all, 24786 names were successfully mapped to unique HGNC symbols out of 26485 total names.
+
+```{r message = FALSE, warning = FALSE}
+rbind(head(temp), temp[24740:24755,])
+cleanData <- temp[,-1]
+rownames(cleanData) <- temp[,1]
+```
+
+## Normalization {#Q678}
+
+The dataset was then filtered. While the original authors retained all samples with expression level greater than 1 count per million (CPM) in at least two samples [@zaccaria2022multiomic], a more stringent filter was applied to this analysis. Only genes with expression level \> 1 CPM in at least six samples were kept.
+
+```{r message = FALSE, warning = FALSE}
+library(edgeR)
+min_samp <- 6 
+data_matrix <- as.matrix(cleanData)
+filteredDM = data_matrix[(rowSums(cpm(data_matrix) > 1) > min_samp), ]
+
+# convert to DGEList object, which will be used for normalization
+dge <- DGEList(filteredDM)
+dispDGE <- estimateDisp(dge)
+```
+
+```{r message = FALSE, warning = FALSE}
+# wrap plotting functions for easier way to call
+box <- function(plotthis, title){
+  boxplot(plotthis, xlab="Samples", ylab="log2(CPM)",
+          las=2, cex=0.85, cex.lab=0.85, cex.axis=0.85, main=title)
+  abline(h=median(apply(plotthis, 2, median)), col="navy", lwd=0.6)
+}
+
+rwb <- colorRampPalette(c("red", "whitesmoke", "blue"))
+
+dens <- function(plotthis, title){
+  cts_density <- apply(plotthis, 2, density)
+  usecolors <- rwb(length(cts_density))
+  plot(cts_density[[1]], 
+       xlim=c(-3, 15), ylim=c(0, 0.2), 
+       type="n", las=2, 
+       xlab = "log2(CPM)", ylab = "Smoothed log2(CPM) density", main=title)
+  for (i in 1:length(cts_density)){
+    lines(cts_density[[i]], col=usecolors[i])
+  }
+  legend("topright", colnames(plotthis), col=usecolors, lty=1, cex=0.5)
+}
+```
+
+The filtered data was examined before normalization using a boxplot and probability density plot. There is a small amount of variance between replicates, but more critically the difference between samples in the same group can be 2-fold or more. For example, C3A's median CPM is about 2x lower than the median CPM in C2A.
+
+```{r message = FALSE, warning = FALSE}
+# if desired, the plots in figure 1 can be generated by un-commenting this code
+# box(log2(filteredDM), "Pre-normalization")
+# dens(log2(filteredDM), "Pre-normalization")
+```
+
+Instead of normalizing by library size as Zaccaria and coworkers did, the data was normalized using the trimmed M-means (TMM) approach built into the edgeR package [@robinson2010edger]. This choice was motivated by the fact that TMM has the best reported performance on simulated datasets when the proportion of differentially-expressed genes is comparatively low [@evans2018selecting], which is the case for our dataset based on analysis from the original paper.
+
+Post-normalization, all samples exhibit substantially less deviation from the median and generally follow very similar probability density distributions (Figure 1).
+
+```{r message = FALSE, warning = FALSE}
+normalized <- calcNormFactors(dispDGE)
+normed_cpm <- cpm(normalized)
+# if desired, the plots in figure 1 can be generated by un-commenting this code
+# box(log2(normed_cpm), "Post-normalization")
+# dens(log2(normed_cpm), "Post-normalization")
+```
+
+![**Figure 1**: Effect of Normalization. (**A**) Boxplots of data before and after normalization. Blue line indicates median of full dataset. (**B**) Smoothed probability density before and after normalization. X-axis is log2(CPM). Plots in this figure can be generated using the code blocks above.](fig1_bcb420_a1.jpg)
+
+------------------------------------------------------------------------
+
+Check for outliers using a histogram. The original authors did not remove any values from the dataset, so it is expected that there are no outliers that would markedly impact data quality. Indeed, there are essentially no outliers on a log2(CPM) scale.
+
+```{r message = FALSE, warning = FALSE}
+hist(log2(normed_cpm), breaks=50)
+```
+
+The biological coefficient of variation (BCV) was also examined after normalization. While several individual genes possessed a high BCV value, the most expressed genes actually had lower-than-average variation (Figure 2A).
+
+```{r message = FALSE, warning = FALSE}
+dispNormed <- estimateDisp(DGEList(normed_cpm))
+
+# un-comment and run to generate figure 2A
+# plotBCV(dispNormed)
+```
+
+The mean-variance relationship becomes more clear with a mean-variance plot, highlighting that a negative binomial model fits the dataset better than a Poisson distribution (Figure 2B). Surprisingly, low mean expression levels are not associated with a wide spread of variances, possibly as a result of the stringent filter used.
+
+```{r message = FALSE, warning = FALSE}
+# un-comment and run to generate figure 2B
+# plotMeanVar(dispNormed, show.raw.vars = TRUE, show.tagwise.vars = TRUE,
+#            show.ave.raw.vars = FALSE, NBline = TRUE, 
+#            show.binned.common.disp.vars = FALSE) 
+```
+
+![**Figure 2**: Mean-Variance Relationship. (**A**) Biological Coefficient of Variation. (**B**) Mean-Variance plot. Gray markers are raw variances and blue markers are tagwise variances.Fitted blue line represents negative binomial model and black line represents Poisson model. Plots may be generated using the code above.](fig2_bcb420_a1.jpg)
+
+------------------------------------------------------------------------
+
+Finally, the sample separation can be visualized on a multidimensional scaling (MDS) plot using the limma package [@ritchie2015limma]. The MDS plot indicates that control and PD samples can be divided into two clusters using a boundary defined as a linear combination of the two leading logFC dimensions. However, there remains substantial separation between samples in the same group, especially for PD samples along dimension 1 (Figure 3). Uncovering the physiological significance of dimension 1 in further analyses could be valuable.
+
+```{r message = FALSE, warning = FALSE}
+library(limma)
+usecolors <- c(rep("red",6), rep("blue", 6))
+
+# un-comment and run to generate figure 3
+plotMDS(normalized, pch=1, col=usecolors)
+legend("topright", pch=1, legend = c("Control", "Parkinson's"), col=usecolors[6:7], cex=0.8)
+```
+
+<font size="2"> **Figure 3**: Multidimensional Scaling Plot. Samples appear broadly clustered within their groups with the boundary approximately positioned along the dim1+dim2 = 2 isocline</font>
+
+For each sample, the two replicates were combined by taking the mean. This yields the final dataset that is ready for analysis. The replicates are only combined post-normalization to balance contributions of each duplicate and prevent bias due to differences in library size or technical variance. Replicate data was preserved during the plotting stage for better visualizing the effect of normalization.
+
+```{r message = FALSE, warning = FALSE}
+finalData <- data.frame(normed_cpm)
+for (i in 1:6){
+    mean_of_samp <- rowSums(finalData[,c(1, 2)])
+    finalData <- finalData[, -c(1,2)]
+    finalData <- cbind(finalData, mean_of_samp)
+}
+colnames(finalData) <- c("C1", "C2", "C3", "P1", "P2", "P3")
+
+# calculate coverage as proportion of rows that made it into the final dataset
+(dim(finalData)[1])/(dim(rawdata)[1])
+```
+
+Final coverage of the processed dataset is 49.7%.
+
+## Links to Assignment Questions
+
+Answers to questions relating to the dataset can be found [here](#Q123)
+
+Answers to questions relating to mapping can be found [in this section](#Q45)
+
+Answers to questions relating to normalization, outliers, replicates and coverage are presented [in this section](#Q678)
+
+## References
