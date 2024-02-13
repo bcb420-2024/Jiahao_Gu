@@ -2,7 +2,7 @@
 bcb420 repo for Jiahao (Jerry) Gu
 
 ## Assignment 1
-HTML notebook can be found [here](https://github.com/bcb420-2024/Jiahao_Gu/A1/A1_JiahaoGu.html). 
+HTML notebook can be found [here](https://github.com/bcb420-2024/Jiahao_Gu/blob/main/A1/A1_JiahaoGu.html). 
 
 When compiling the R notebook, the working directory should be set to the folder A1. This folder contains the files referenced in the R notebook, including a critical .csv file containing additional mappings. 
 
