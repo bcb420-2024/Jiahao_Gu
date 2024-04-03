@@ -12,3 +12,8 @@ Some of the code used to plot figures is commented out on the R notebook. Uncomm
 HTML notebook can be found [here](https://github.com/bcb420-2024/Jiahao_Gu/blob/main/A2/A2_JiahaoGu.html). The R markdown notebook can be found in the folder A2
 
 When compiling the R notebook, the working directory should be set to the folder A2. The notebook requires this to read an .rds file containing the normalized data from Assignment 1.
+
+## Assignment 3
+HTML notebook can be found [here](https://github.com/bcb420-2024/Jiahao_Gu/blob/main/A3/A3_JiahaoGu.html). The R markdown notebook can be found in the folder A3
+
+When compiling the R notebook, the working directory should be set to the folder A3. This allows the figures to be loaded correctly. Since part of the code snippet references assignment 2, the data used for assignment 2 is also included in the subfolder A2 for parsing. 
